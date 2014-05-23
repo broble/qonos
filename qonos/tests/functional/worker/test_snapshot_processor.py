@@ -813,29 +813,3 @@ class TestSnapshotProcessorNotifications(BaseTestSnapshotProcessor):
                 ('qonos.job.update', 'INFO', 'TIMED_OUT')]
             self.assert_job_notification_events(processor,
                                                 expected_notifications)
-
-
-class TestSnapshotProcessorImageName(BaseTestSnapshotProcessor):
-
-    def test_generate_image_name(self):
-        job = self.job_fixture("INSTANCE_ID")
-        timeutils.set_time_override(datetime.datetime(2013, 3, 22, 22, 39, 27))
-        timestamp = '1363991967'
-
-        with TestableSnapshotProcessor(job, None, []) as processor:
-            image_name = processor.generate_image_name("test")
-            self.assertEqual(image_name, 'Daily-test-' + timestamp)
-
-    def test_generate_image_name_long_server_name(self):
-        job = self.job_fixture("INSTANCE_ID")
-
-        timeutils.set_time_override(datetime.datetime(2013, 3, 22, 22, 39, 27))
-        timestamp = '1363991967'
-        fake_server_name = 'a' * 255
-        expected_server_name = 'a' * (255 - len(timestamp) - len('Daily--'))
-
-        with TestableSnapshotProcessor(job, None, []) as processor:
-            image_name = processor.generate_image_name(fake_server_name)
-            expected_image_name = (
-                'Daily-' + expected_server_name + '-' + timestamp)
-            self.assertEqual(image_name, expected_image_name)

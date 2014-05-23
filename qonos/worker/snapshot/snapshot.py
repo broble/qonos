@@ -63,6 +63,9 @@ _FAILED_IMAGE_STATUSES = ['KILLED', 'DELETED', 'PENDING_DELETE', 'ERROR']
 # it will get picked up again fairly quickly
 _WORKER_STOP_TIMEOUT_SEC = 300
 
+DAILY = 'Daily'
+WEEKLY = 'Weekly'
+
 
 class SnapshotProcessor(worker.JobProcessor):
     def __init__(self):
@@ -104,7 +107,9 @@ class SnapshotProcessor(worker.JobProcessor):
 
         job_id = job['id']
 
-        if not self._check_schedule_exists(job):
+        schedule = self._get_schedule(job)
+        LOG.debug("Schedule: %s" % str(schedule))
+        if schedule is None:
             msg = ('Schedule %(schedule_id)s deleted for job %(job_id)s' %
                    {'schedule_id': job['schedule_id'], 'job_id': job_id})
             self._job_cancelled(job, msg)
@@ -131,7 +136,7 @@ class SnapshotProcessor(worker.JobProcessor):
         image_id = self._get_image_id(job)
         if image_id is None:
             image_id = self._create_image(job, instance_id,
-                                          job['schedule_id'])
+                                          schedule)
             if image_id is None:
                 return
         else:
@@ -197,11 +202,17 @@ class SnapshotProcessor(worker.JobProcessor):
                 raise exc.PollingException(err_msg)
         return image_id
 
-    def _create_image(self, job, instance_id, schedule_id):
+    @staticmethod
+    def _get_image_prefix(schedule):
+        image_prefix = DAILY
+        if schedule.get('day_of_week', None) is not None:
+            image_prefix = WEEKLY
+        return image_prefix
+
+    def _create_image(self, job, instance_id, schedule):
         metadata = {
             "org.openstack__1__created_by": "scheduled_images_service"}
 
-        image_id = None
         try:
             instance_name_msg = ("Attempting to get the instance name for "
                                "instance_id %s" % instance_id)
@@ -213,7 +224,7 @@ class SnapshotProcessor(worker.JobProcessor):
             LOG.info(msg)
             image_id = self._get_nova_client().servers.create_image(
                 instance_id,
-                self.generate_image_name(server_name),
+                self.generate_image_name(schedule, server_name),
                 metadata)
         except exceptions.NotFound:
             msg = ('Instance %(instance_id)s specified by job %(job_id)s '
@@ -232,23 +243,24 @@ class SnapshotProcessor(worker.JobProcessor):
         self._add_job_metadata(image_id=image_id)
         return image_id
 
-    def generate_image_name(self, server_name):
+    def generate_image_name(self, schedule, server_name):
         """
         Creates a string based on the specified server name and current time.
 
         The string is of the format:
-        "Daily-<truncated-server-name>-<unix-timestamp>"
+        "<prefix>-<truncated-server-name>-<unix-timestamp>"
         """
-        prefix = 'Daily-'
+
         max_name_length = 255
+        prefix = self._get_image_prefix(schedule)
         now = str(calendar.timegm(self._get_utcnow().utctimetuple()))
 
         #NOTE(ameade): Truncate the server name so the image name is within
         # 255 characters total
-        server_name_len = max_name_length - len(now) - len(prefix) - len('-')
+        server_name_len = max_name_length - len(now) - len(prefix) - len('--')
         server_name = server_name[:server_name_len]
 
-        return (prefix + server_name + '-' + str(now))
+        return ("%s-%s-%s" % (prefix, server_name, str(now)))
 
     def _add_job_metadata(self, **to_add):
         metadata = self.current_job['metadata']
@@ -455,13 +467,12 @@ class SnapshotProcessor(worker.JobProcessor):
         metadata = job['metadata']
         return metadata.get('user_name')
 
-    def _check_schedule_exists(self, job):
+    def _get_schedule(self, job):
         qonosclient = self.get_qonos_client()
         try:
-            qonosclient.get_schedule(job['schedule_id'])
-            return True
-        except qonos_ex.NotFound, ex:
-            return False
+            return qonosclient.get_schedule(job['schedule_id'])
+        except qonos_ex.NotFound:
+            return None
 
     # Seam for testing
     def _get_utcnow(self):

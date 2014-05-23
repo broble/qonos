@@ -88,7 +88,7 @@ class TestSnapshotProcessor(test_utils.BaseTestCase):
         return image
 
     def _init_qonos_client(self, schedule=None):
-        if schedule:
+        if schedule is not None:
             self.qonos_client.get_schedule(mox.IsA(str)).\
                 AndReturn(schedule)
         else:
@@ -106,7 +106,8 @@ class TestSnapshotProcessor(test_utils.BaseTestCase):
             self.worker.update_job_metadata(fakes.JOB_ID, metadata).\
                 AndReturn(metadata)
 
-        self._init_qonos_client(MockSchedule())
+        schedule = {}
+        self._init_qonos_client(schedule=schedule)
 
     def _simple_prepare_worker_mock(self, num_processing_updates=0,
                                     skip_metadata_update=False):
@@ -149,7 +150,7 @@ class TestSnapshotProcessor(test_utils.BaseTestCase):
         self.mox.VerifyAll()
 
     def test_process_job_should_cancel_if_no_instance_id(self):
-        self._init_qonos_client(schedule=MockSchedule())
+        self._init_qonos_client(schedule=dict())
         self.mox.StubOutWithMock(utils, 'generate_notification')
         utils.generate_notification(None, 'qonos.job.run.start', mox.IsA(dict),
                                     mox.IsA(str))
@@ -873,22 +874,45 @@ class TestSnapshotProcessor(test_utils.BaseTestCase):
 
         self.mox.VerifyAll()
 
-    def test_generate_image_name(self):
+    def test_generate_image_name_daily(self):
+        schedule = {}
         timeutils.set_time_override(datetime.datetime(2013, 3, 22, 22, 39, 27))
         timestamp = '1363991967'
         processor = TestableSnapshotProcessor(self.nova_client)
-        image_name = processor.generate_image_name("test")
+        image_name = processor.generate_image_name(schedule, 'test')
         self.assertEqual(image_name, 'Daily-test-' + timestamp)
 
+    def test_generate_image_name_weekly(self):
+        schedule = {'day_of_week': 1}
+        timeutils.set_time_override(datetime.datetime(2013, 3, 22, 22, 39, 27))
+        timestamp = '1363991967'
+        processor = TestableSnapshotProcessor(self.nova_client)
+        image_name = processor.generate_image_name(schedule, 'test')
+        self.assertEqual(image_name, 'Weekly-test-' + timestamp)
+
     def test_generate_image_name_long_server_name(self):
+        schedule = {}
         timeutils.set_time_override(datetime.datetime(2013, 3, 22, 22, 39, 27))
         timestamp = '1363991967'
         processor = TestableSnapshotProcessor(self.nova_client)
         fake_server_name = 'a' * 255
-        expected_server_name = 'a' * (255 - len(timestamp) - len('Daily--'))
-        image_name = processor.generate_image_name(fake_server_name)
-        expected_image_name = 'Daily-' + expected_server_name + '-' + timestamp
+        prefix = 'Daily'
+        expected_server_name = 'a' * (255 - len(timestamp) -
+                                      len(prefix + '--'))
+        image_name = processor.generate_image_name(schedule, fake_server_name)
+        expected_image_name = (prefix + '-' + expected_server_name + '-' +
+                               timestamp)
         self.assertEqual(image_name, expected_image_name)
+
+    def test_get_image_prefix_daily(self):
+        schedule = {}
+        prefix = snapshot.SnapshotProcessor._get_image_prefix(schedule)
+        self.assertEqual('Daily', prefix)
+
+    def test_get_image_prefix_weekly(self):
+        schedule = {'day_of_week': 1}
+        prefix = snapshot.SnapshotProcessor._get_image_prefix(schedule)
+        self.assertEqual('Weekly', prefix)
 
 
 class MockNovaClientFactory(object):
