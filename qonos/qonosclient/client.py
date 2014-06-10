@@ -164,7 +164,7 @@ class Client(object):
                           error_message=None):
         body = {'status': {'status': status}}
 
-        statuses = ['ERROR', 'CANCELLED', 'HARD_TIMED_OUT']
+        statuses = ['ERROR', 'CANCELLED', 'HARD_TIMED_OUT', 'MAX_RETRIED']
         if status.upper() in statuses and error_message:
             body['status']['error_message'] = error_message
         if timeout:
