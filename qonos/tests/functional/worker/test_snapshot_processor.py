@@ -17,6 +17,7 @@
 import copy
 import datetime
 import mock
+import traceback as tb
 
 from novaclient import exceptions
 from oslo.config import cfg
@@ -286,15 +287,21 @@ class TestSnapshotProcessorJobProcessing(BaseTestSnapshotProcessor):
             exc = exceptions.NotFound('Instance not found!!')
             processor.nova_client.images.get = mock.Mock(mock.ANY,
                                                          side_effect=exc)
-            with self.assertRaises(exception.PollingException) as cm:
-                processor.process_job(job)
+            processor.process_job(job)
 
+            org_err_msg = tb.format_exception_only(type(exc), exc)
+            err_val = {"job_id": job['id'],
+                       "image_id": job['metadata']['image_id'],
+                       "org_err_msg": org_err_msg}
             expected_err_msg = ("ERROR get_image_id():"
-                                " job_id: %s, image_id: %s" %
-                                (job['id'], job['metadata']['image_id']))
-            self.assertTrue(str(cm.exception).startswith(expected_err_msg))
+                                " job_id: %(job_id)s, image_id: %(image_id)s"
+                                " err:%(org_err_msg)s") % err_val
+
             self.assert_update_job_statuses(processor, ['PROCESSING', 'ERROR'])
-            self.assert_error_job_update_with_timeout(processor)
+            self.assert_job_status_values(processor, {
+                'status': 'ERROR',
+                'error_message': expected_err_msg
+            })
 
     def test_process_job_shouldnt_create_img_if_curr_img_status_is_none(self):
         server = self.server_instance_fixture('INSTANCE_ID', "test")
@@ -459,11 +466,26 @@ class TestSnapshotProcessorPolling(BaseTestSnapshotProcessor):
         server = self.server_instance_fixture("INSTANCE_ID", "test")
         for error_status in snapshot._FAILED_IMAGE_STATUSES:
             job = self.job_fixture(server.id)
-            images = [self.image_fixture('IMAGE_ID', error_status, server.id)]
+            failed_image = self.image_fixture('IMAGE_ID',
+                                              error_status, server.id)
+            images = [failed_image]
 
             with TestableSnapshotProcessor(job, server, images) as processor:
-                self.assertRaises(exception.PollingException,
-                                  processor.process_job, job)
+                processor.process_job(job)
+
+                self.assertEqual('ERROR', job['status'])
+                err_val = {'image_id': failed_image.id,
+                           "image_status": failed_image.status,
+                           "job_id": job['id']}
+                expected_err_msg = (
+                    "PollingErr: Got failed image status. Details:"
+                    " image_id: %(image_id)s, 'image_status': %(image_status)s"
+                    " job_id: %(job_id)s") % err_val
+
+                self.assert_job_status_values(processor, {
+                    'status': 'ERROR',
+                    'error_message': expected_err_msg
+                })
 
                 self.assertEqual(0, processor.timeout_count)
                 self.assert_update_job_statuses(processor,
@@ -481,8 +503,21 @@ class TestSnapshotProcessorPolling(BaseTestSnapshotProcessor):
         ]
 
         with TestableSnapshotProcessor(job, server, images) as processor:
-            self.assertRaises(exception.PollingException,
-                              processor.process_job, job)
+            processor.process_job(job)
+
+            self.assertEqual('ERROR', job['status'])
+            err_val = {'image_id': job['metadata']['image_id'],
+                       "image_status": None,
+                       "job_id": job['id']}
+            expected_err_msg = (
+                "PollingErr: Got failed image status. Details:"
+                " image_id: %(image_id)s, 'image_status': %(image_status)s"
+                " job_id: %(job_id)s") % err_val
+
+            self.assert_job_status_values(processor, {
+                'status': 'ERROR',
+                'error_message': expected_err_msg
+            })
 
             self.assertEqual(0, processor.timeout_count)
             self.assert_update_job_statuses(processor,
@@ -493,21 +528,39 @@ class TestSnapshotProcessorPolling(BaseTestSnapshotProcessor):
         server = self.server_instance_fixture("INSTANCE_ID", "test")
         for error_status in snapshot._FAILED_IMAGE_STATUSES:
             job = self.job_fixture(server.id)
-            images = [self.image_fixture('IMAGE_ID', 'SAVING', server.id),
-                      self.image_fixture('IMAGE_ID', error_status, server.id)]
+            image_id = 'IMAGE_ID'
+            images = [self.image_fixture(image_id, 'SAVING', server.id),
+                      self.image_fixture(image_id, error_status, server.id)]
 
             with TestableSnapshotProcessor(job, server, images) as processor:
-                self.assertRaises(exception.PollingException,
-                                  processor.process_job, job)
+                processor.process_job(job)
 
                 self.assertEqual(0, processor.timeout_count)
+
+                err_val = {'image_id': image_id,
+                           "image_status": error_status,
+                           "job_id": job['id']}
+                expected_err_msg = (
+                    "PollingErr: Got failed image status. Details:"
+                    " image_id: %(image_id)s, 'image_status': %(image_status)s"
+                    " job_id: %(job_id)s") % err_val
+
+                self.assert_job_status_values(processor, {
+                    'status': 'ERROR',
+                    'error_message': expected_err_msg
+                })
+
                 self.assert_update_job_statuses(processor,
                                                 ['PROCESSING', 'ERROR'])
                 self.assert_error_job_update_with_timeout(processor)
 
     def test_polling_job_timeout_after_max_retries(self):
-        decrement_for_timeout = -10
-        self.config(job_timeout_update_increment_min=decrement_for_timeout,
+        initial_timeout = -60
+        timeout_extension = .000001
+
+        self.config(job_timeout_extension_sec=timeout_extension,
+                    group='snapshot_worker')
+        self.config(job_timeout_initial_value_sec=initial_timeout,
                     group='snapshot_worker')
         self.config(job_timeout_max_updates=3, group='snapshot_worker')
 
@@ -520,17 +573,68 @@ class TestSnapshotProcessorPolling(BaseTestSnapshotProcessor):
 
         with TestableSnapshotProcessor(job, server, images) as processor:
             processor.process_job(job)
-
             self.assertEqual(3, processor.timeout_count)
             self.assert_update_job_statuses(
                 processor, (['PROCESSING'] * 4 + ['TIMED_OUT']))
             self.assertEqual('TIMED_OUT', job['status'])
 
+    def test_polling_job_timeout_extension_with_max_retries(self):
+        timeout_extension = 3600
+        job_timeout_max_updates_count = 3
+
+        self.config(job_timeout_extension_sec=timeout_extension,
+                    group='snapshot_worker')
+        self.config(job_timeout_max_updates=job_timeout_max_updates_count,
+                    group='snapshot_worker')
+        self.config(job_timeout_initial_value_sec=10800,
+                    group='snapshot_worker')
+
+        server = self.server_instance_fixture("INSTANCE_ID", "test")
+        job = self.job_fixture(server.id)
+        images = [self.image_fixture('IMAGE_ID', 'QUEUED', server.id),
+                  self.image_fixture('IMAGE_ID', 'SAVING', server.id),
+                  self.image_fixture('IMAGE_ID', 'SAVING', server.id),
+                  self.image_fixture('IMAGE_ID', 'SAVING', server.id)]
+
+        now = timeutils.utcnow()
+        timeutils.set_time_override(now)
+        timeutils.advance_time_delta(
+            datetime.timedelta(seconds=timeout_extension))
+
+        try:
+            with TestableSnapshotProcessor(job, server, images) as p:
+                p.next_timeout = now + p.initial_timeout
+                p.next_update = now + p.update_interval
+
+                #NOTE(venkatesh): unfortunately had to use a protected method
+                # for testing. Else there seems to be no easier way to test
+                # this scenario. we need to fix this as part of refactoring
+                # SnapshotJobProcessor.
+                while True:
+                    try:
+                        p._update_job(job['id'], 'PROCESSING')
+                    except exception.OutOfTimeException:
+                        break
+                    timeutils.advance_time_delta(
+                        datetime.timedelta(seconds=timeout_extension))
+
+                total_timeout_duration = datetime.timedelta(
+                    seconds=(timeout_extension * job_timeout_max_updates_count)
+                )
+                self.assertEqual(
+                    now + (p.initial_timeout +
+                           total_timeout_duration),
+                    p.next_timeout
+                )
+                self.assertEqual(3, p.timeout_count)
+        finally:
+            timeutils.clear_time_override()
+
     def test_polling_job_is_successful_after_first_timeout(self):
         server = self.server_instance_fixture("INSTANCE_ID", "test")
 
-        decrement_for_timeout = -10
-        self.config(job_timeout_update_increment_min=decrement_for_timeout,
+        initial_timeout = -60
+        self.config(job_timeout_initial_value_sec=initial_timeout,
                     group='snapshot_worker')
         self.config(job_timeout_max_updates=3, group='snapshot_worker')
 
@@ -907,13 +1011,25 @@ class TestSnapshotProcessorNotifications(BaseTestSnapshotProcessor):
     def test_notifications_for_errored_job_on_failed_image_status(self):
         server = self.server_instance_fixture("INSTANCE_ID", "test")
         job = self.job_fixture(server.id)
-        images = [self.image_fixture('IMAGE_ID', 'KILLED', server.id)]
+        failed_image = self.image_fixture('IMAGE_ID', 'KILLED', server.id)
+        images = [failed_image]
 
         with TestableSnapshotProcessor(job, server, images) as processor:
-            self.assertRaises(exception.PollingException,
-                              processor.process_job, job)
+            processor.process_job(job)
 
             self.assertEqual('ERROR', job['status'])
+            err_val = {'image_id': failed_image.id,
+                       "image_status": failed_image.status,
+                       "job_id": job['id']}
+            expected_err_msg = (
+                "PollingErr: Got failed image status. Details:"
+                " image_id: %(image_id)s, 'image_status': %(image_status)s"
+                " job_id: %(job_id)s") % err_val
+
+            self.assert_job_status_values(processor, {
+                'status': 'ERROR',
+                'error_message': expected_err_msg
+            })
             expected_notifications = [
                 ('qonos.job.run.start', 'INFO', 'QUEUED'),
                 ('qonos.job.update', 'INFO', 'PROCESSING'),
@@ -922,8 +1038,12 @@ class TestSnapshotProcessorNotifications(BaseTestSnapshotProcessor):
                                                 expected_notifications)
 
     def test_notifications_for_timeout_job_after_max_retries(self):
-        decrement_for_timeout = -10
-        self.config(job_timeout_update_increment_min=decrement_for_timeout,
+        initial_timeout = -60
+        timeout_extension = .000001
+
+        self.config(job_timeout_extension_sec=timeout_extension,
+                    group='snapshot_worker')
+        self.config(job_timeout_initial_value_sec=initial_timeout,
                     group='snapshot_worker')
         self.config(job_timeout_max_updates=2, group='snapshot_worker')
 

@@ -44,13 +44,18 @@ snapshot_worker_opts = [
                help=_('How often to poll Nova for the image status')),
     cfg.IntOpt('job_update_interval_sec', default=300,
                help=_('How often to update the job status, in seconds')),
-    cfg.IntOpt('job_timeout_update_interval_min', default=60,
-               help=_('How often to update the job timeout, in minutes')),
-    cfg.IntOpt('job_timeout_update_increment_min', default=60,
-               help=_('How much to increment the timeout, in minutes')),
+    cfg.IntOpt('job_timeout_initial_value_sec', default=3600,
+               help=_('Initial timeout value, in seconds')),
+    cfg.IntOpt('job_timeout_extension_sec', default=3600,
+               help=_('When nearing timeout, extend it by, in seconds')),
+    cfg.IntOpt('job_timeout_extension_threshold_sec', default=300,
+               help=_('Extend if timeout is less than threshold, in seconds')),
     cfg.IntOpt('job_timeout_max_updates', default=3,
                help=_('How many times to update the timeout before '
                       'considering the job to be failed')),
+    cfg.IntOpt('job_timeout_backoff_increment_sec', default=3600,
+               help=_('Timeout increment to use when an error occurs, in '
+                      'seconds')),
     cfg.IntOpt('job_timeout_backoff_factor', default=1,
                help=_('Timeout multiplier to use when an error occurs')),
     cfg.IntOpt('max_retry', default=5,
@@ -82,13 +87,19 @@ class SnapshotProcessor(worker.JobProcessor):
         self.timeout_count = 0
         self.timeout_max_updates = CONF.snapshot_worker.job_timeout_max_updates
         self.next_timeout = None
+        self.timeout_extension = datetime.timedelta(
+            seconds=CONF.snapshot_worker.job_timeout_extension_sec)
+        self.extension_threshold = datetime.timedelta(
+            seconds=CONF.snapshot_worker.job_timeout_extension_threshold_sec)
         self.update_interval = datetime.timedelta(
             seconds=CONF.snapshot_worker.job_update_interval_sec)
-        self.timeout_increment = datetime.timedelta(
-            minutes=CONF.snapshot_worker.job_timeout_update_increment_min)
+        self.initial_timeout = datetime.timedelta(
+            seconds=CONF.snapshot_worker.job_timeout_initial_value_sec)
         self.image_poll_interval = CONF.snapshot_worker.image_poll_interval_sec
-        self.job_timeout_backoff_factor = (CONF.snapshot_worker
-                                           .job_timeout_backoff_factor)
+        self.timeout_backoff_increment = datetime.timedelta(
+            seconds=CONF.snapshot_worker.job_timeout_backoff_increment_sec)
+        self.timeout_backoff_factor = (CONF.snapshot_worker
+                                       .job_timeout_backoff_factor)
 
         if not nova_client_factory:
             nova_client_factory = importutils.import_object(
@@ -96,13 +107,28 @@ class SnapshotProcessor(worker.JobProcessor):
         self.nova_client_factory = nova_client_factory
 
     def process_job(self, job):
-        LOG.info(_("Worker %(worker_id)s Processing job: %(job)s") %
+        LOG.info(_("Worker %(worker_id)s processing job: %(job)s") %
                  {'worker_id': self.worker.worker_id,
                      'job': job['id']})
-        LOG.debug(_("Worker %(worker_id)s Processing job: %(job)s") %
+        LOG.debug(_("Worker %(worker_id)s processing job: %(job)s") %
                   {'worker_id': self.worker.worker_id,
                    'job': str(job)})
+        try:
+            self._process_job(job)
+        except exc.PollingException as e:
+            LOG.exception(e)
+        except Exception:
+            msg = _("Worker %(worker_id)s error processing job:"
+                    " %(job)s")
+            LOG.exception(msg % {'worker_id': self.worker.worker_id,
+                                 'job': job['id']})
 
+            exc_type, exc_value, exc_tb = sys.exc_info()
+            err_msg = (_('Job process failed: %s')
+                       % tb.format_exception_only(exc_type, exc_value))
+            self._job_error_occurred(job, error_message=err_msg)
+
+    def _process_job(self, job):
         payload = {'job': job}
         if job['status'] == 'QUEUED':
             self.send_notification_start(payload)
@@ -137,7 +163,7 @@ class SnapshotProcessor(worker.JobProcessor):
                    {'schedule_id': job['schedule_id'], 'job_id': job_id})
             self._job_cancelled(job, msg)
 
-            LOG.info(_('Worker %(worker_id)s Job cancelled: %(msg)s') %
+            LOG.info(_('Worker %(worker_id)s job cancelled: %(msg)s') %
                      {'worker_id': self.worker.worker_id,
                       'msg': msg})
             return
@@ -145,7 +171,7 @@ class SnapshotProcessor(worker.JobProcessor):
         self.current_job = job
 
         now = self._get_utcnow()
-        self.next_timeout = now + self.timeout_increment
+        self.next_timeout = now + self.initial_timeout
         self._job_processing(job, self.next_timeout)
         self.next_update = self._get_utcnow() + self.update_interval
 
@@ -163,7 +189,7 @@ class SnapshotProcessor(worker.JobProcessor):
             if image_id is None:
                 return
         else:
-            LOG.info(_("Worker %(worker_id)s Resuming image: %(image_id)s")
+            LOG.info(_("Worker %(worker_id)s resuming image: %(image_id)s")
                      % {'worker_id': self.worker.worker_id,
                         'image_id': image_id})
 
@@ -175,7 +201,11 @@ class SnapshotProcessor(worker.JobProcessor):
 
             active = image_status == 'ACTIVE'
             if not active:
-                retry = self._try_update(job_id, "PROCESSING")
+                retry = True
+                try:
+                    self._update_job(job_id, "PROCESSING")
+                except exc.OutOfTimeException:
+                    retry = False
                 time.sleep(self.image_poll_interval)
 
         if active:
@@ -237,7 +267,7 @@ class SnapshotProcessor(worker.JobProcessor):
 
         try:
             instance_name_msg = ("Attempting to get the instance name for "
-                               "instance_id %s" % instance_id)
+                                 "instance_id %s" % instance_id)
             LOG.info(instance_name_msg)
             server_name = self._get_nova_client().servers.\
                 get(instance_id).name
@@ -256,7 +286,7 @@ class SnapshotProcessor(worker.JobProcessor):
             self._job_error_occurred(job, error_message=msg)
             return None
 
-        LOG.info(_("Worker %(worker_id)s Started create image: "
+        LOG.info(_("Worker %(worker_id)s started create image: "
                    " %(image_id)s") % {'worker_id': self.worker.worker_id,
                                        'image_id': image_id})
 
@@ -328,19 +358,18 @@ class SnapshotProcessor(worker.JobProcessor):
 
             if len(scheduled_images) > retention:
                 to_delete = scheduled_images[retention:]
-                LOG.info(_('Worker %(worker_id)s '
-                           'Removing %(remove)d images for a retention '
-                           'of %(retention)d')
-                          % {'worker_id': self.worker.worker_id,
-                             'remove': len(to_delete),
-                             'retention': retention})
+                LOG.info(_('Worker %(worker_id)s removing %(remove)d '
+                           'images for a retention of %(retention)d') %
+                         {'worker_id': self.worker.worker_id,
+                          'remove': len(to_delete),
+                          'retention': retention})
                 for image in to_delete:
                     image_id = image.id
                     self._get_nova_client().images.delete(image_id)
-                    LOG.info(_('Worker %(worker_id)s Removed image '
-                               '%(image_id)s')
-                              % {'worker_id': self.worker.worker_id,
-                                 'image_id': image_id})
+                    LOG.info(_('Worker %(worker_id)s removed image '
+                               '%(image_id)s') %
+                             {'worker_id': self.worker.worker_id,
+                              'image_id': image_id})
         else:
             msg = ("Retention %(retention)s is found for for schedule "
                    "%(sched)s for %(instance)s" % {'retention': retention,
@@ -356,13 +385,13 @@ class SnapshotProcessor(worker.JobProcessor):
                 rax_scheduled_images_python_novaclient_ext.get(instance_id)
             ret_str = result.retention
             retention = int(ret_str or 0)
-        except exceptions.NotFound, e:
+        except exceptions.NotFound:
             msg = _('Could not retrieve retention for server %s: either the'
                     ' server was deleted or scheduled images for'
                     ' the server was disabled.') % instance_id
 
             LOG.warn(msg)
-        except Exception, e:
+        except Exception:
             msg = _('Error getting retention for server %s: ')
             LOG.exception(msg % instance_id)
 
@@ -377,10 +406,10 @@ class SnapshotProcessor(worker.JobProcessor):
             # 'image.status.upper() == "ACTIVE"' is a temporary hack to
             # incorporate rm2400. Ideally, this filtering should be performed
             # by passing an appropriate filter to the novaclient.
-            if (metadata.get("org.openstack__1__created_by")
-                == "scheduled_images_service" and
-                metadata.get("instance_uuid") == instance_id and
-                image.status.upper() == "ACTIVE"):
+            if (metadata.get("org.openstack__1__created_by") ==
+               "scheduled_images_service" and
+               metadata.get("instance_uuid") == instance_id and
+               image.status.upper() == "ACTIVE"):
                 scheduled_images.append(image)
 
         scheduled_images = sorted(scheduled_images,
@@ -428,7 +457,7 @@ class SnapshotProcessor(worker.JobProcessor):
         self.send_notification_job_update({'job': job})
 
     def _job_error_occurred(self, job, error_message=None):
-        timeout = self._get_updated_job_timeout(job['id'])
+        timeout = self._get_updated_job_timeout()
         response = self.update_job(job['id'], 'ERROR', timeout=timeout,
                                    error_message=error_message)
         if response:
@@ -437,10 +466,10 @@ class SnapshotProcessor(worker.JobProcessor):
         job_payload['error_message'] = error_message or ''
         self.send_notification_job_update({'job': job_payload}, level='ERROR')
 
-    def _get_updated_job_timeout(self, job_id):
-        backoff_factor = (self.job_timeout_backoff_factor
+    def _get_updated_job_timeout(self):
+        backoff_factor = (self.timeout_backoff_factor
                           ** int(self.current_job['retry_count']))
-        timeout_increment = self.timeout_increment * backoff_factor
+        timeout_increment = self.timeout_backoff_increment * backoff_factor
 
         now = self._get_utcnow()
         timeout = now + timeout_increment
@@ -471,25 +500,31 @@ class SnapshotProcessor(worker.JobProcessor):
         job['status'] = resp.get('status')
         job['timeout'] = resp.get('timeout')
 
-    def _try_update(self, job_id, status):
+    def _update_job(self, job_id, status):
         now = self._get_utcnow()
-        # Time for a timeout update?
-        if now >= self.next_timeout:
-            # Out of timeouts?
-            if self.timeout_count >= self.timeout_max_updates:
-                return False
+        time_remaining = self.next_timeout - now
 
-            self.next_timeout = self.next_timeout + self.timeout_increment
+        # Getting close to timeout; extend if possible
+        if(time_remaining < self.extension_threshold and
+           self.timeout_count < self.timeout_max_updates):
+            if self.next_timeout > now:
+                self.next_timeout += self.timeout_extension
+            else:
+                self.next_timeout = now + self.timeout_extension
             self.timeout_count += 1
+            # Still working; don't reclaim my job; timeout was extended
             self.update_job(job_id, status, self.next_timeout)
-            return True
+            return
+
+        # Out of time
+        if now >= self.next_timeout:
+            kwargs = {'job': job_id, 'status': status}
+            raise exc.OutOfTimeException(**kwargs)
 
         # Time for a status-only update?
         if now >= self.next_update:
             self.next_update = now + self.update_interval
             self.update_job(job_id, status)
-
-        return True
 
     def _get_instance_id(self, job):
         metadata = job['metadata']
